@@ -2,10 +2,17 @@
 Telegram bot: watches XAUUSD 15M chart in the background and
 PUSHES you a message automatically when a new Buy/Sell signal appears.
 Also supports /signal for an on-demand check.
+
+Runs a tiny Flask web server alongside the bot so this can be deployed
+as a Render FREE Web Service (Render no longer offers free background
+workers). An external pinger (e.g. UptimeRobot) hits the web server
+every few minutes to keep it from sleeping.
 """
 import os
 import json
 import logging
+import threading
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -18,6 +25,19 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHECK_INTERVAL_SECONDS = 15 * 60  # check every 15 minutes, matches candle close
 STATE_FILE = "state.json"
+PORT = int(os.environ.get("PORT", 10000))  # Render sets PORT automatically
+
+# --- Tiny web server so Render treats this as a free Web Service ---
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def health():
+    return "Gold signal bot is running."
+
+
+def run_web_server():
+    flask_app.run(host="0.0.0.0", port=PORT)
 
 
 def load_state():
@@ -129,6 +149,10 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable not set")
 
+    # Start the tiny web server in the background so Render's free
+    # Web Service tier accepts this deployment and keeps it pingable.
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
@@ -145,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
