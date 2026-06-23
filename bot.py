@@ -1,12 +1,11 @@
 """
-Telegram bot: watches XAUUSD 15M chart in the background and
-PUSHES you a message automatically when a new Buy/Sell signal appears.
-Also supports /signal for an on-demand check.
+London Session Trading Bot - Monitors 5 pairs for strategy signals
+Sends Telegram alerts when conditions are met:
+1. 4H candle high/low swiped (1-2pm GMT)
+2. 5M structure shift
+3. RSI crosses 50 midline
 
-Runs a tiny Flask web server alongside the bot so this can be deployed
-as a Render FREE Web Service (Render no longer offers free background
-workers). An external pinger (e.g. UptimeRobot) hits the web server
-every few minutes to keep it from sleeping.
+Runs a tiny Flask web server alongside the bot for Render deployment.
 """
 import os
 import json
@@ -17,55 +16,55 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
-from analysis import analyze
+from analysis import analyze_pair, PAIRS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHECK_INTERVAL_SECONDS = 15 * 60  # check every 15 minutes, matches candle close
+CHECK_INTERVAL_SECONDS = 30  # check every 30 seconds for 5M signals
 STATE_FILE = "state.json"
-PORT = int(os.environ.get("PORT", 10000))  # Render sets PORT automatically
+PORT = int(os.environ.get("PORT", 10000))
 
-# --- Tiny web server so Render treats this as a free Web Service ---
+# --- Tiny web server for Render ---
 flask_app = Flask(__name__)
-
 
 @flask_app.route("/")
 def health():
-    return "Gold signal bot is running."
-
+    return "London Session Trading Bot is running."
 
 def run_web_server():
     flask_app.run(host="0.0.0.0", port=PORT)
-
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"chat_ids": [], "last_direction": None}
-
+    return {"chat_ids": [], "alerts_sent": {}}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-
-def format_signal_message(result):
+def format_signal_message(symbol, result):
     direction = result["direction"]
     price = result["price"]
+    level_high = result["level_high"]
+    level_low = result["level_low"]
     emoji = "🟢" if direction == "BUY" else "🔴"
+    
     return (
-        f"{emoji} *XAUUSD 15M — {direction} SIGNAL*\n\n"
-        f"Entry: {price:.2f}\n"
-        f"SL: {result['sl']:.2f}\n"
-        f"TP: {result['tp']:.2f}\n"
-        f"R:R: 1:2 | ATR: {result['atr']:.2f}\n\n"
+        f"{emoji} *{symbol} — {direction} SIGNAL* {emoji}\n\n"
+        f"💰 Price: {price:.4f}\n"
+        f"📐 4H High: {level_high:.4f}\n"
+        f"📐 4H Low: {level_low:.4f}\n\n"
+        f"✅ *Conditions Met:*\n"
+        f"  ✓ 4H level swiped\n"
+        f"  ✓ 5M structure shift\n"
+        f"  ✓ RSI crossed 50 midline\n\n"
         f"_Reasoning:_\n" + "\n".join(f"• {r}" for r in result["reasons"]) +
         f"\n\n⚠️ Not financial advice. Confirm before entering."
     )
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -73,14 +72,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in state["chat_ids"]:
         state["chat_ids"].append(chat_id)
         save_state(state)
+    
+    pairs_list = "\n  • ".join(PAIRS.keys())
     await update.message.reply_text(
-        "Gold (XAUUSD) Signal Bot active.\n\n"
-        "You'll automatically get a message here whenever a new Buy/Sell "
-        "signal forms (checked every 15 minutes).\n\n"
-        "You can also send /signal anytime for an on-demand check, or "
-        "/stop to turn off automatic alerts."
+        f"🚀 *London Session Trading Bot Active*\n\n"
+        f"📊 *Monitoring:*\n  • {pairs_list}\n\n"
+        f"⏰ *London Session:* 07:00 - 15:00 GMT\n"
+        f"📌 *Level Formation:* 13:00 - 14:00 GMT\n\n"
+        f"You'll automatically get alerts when:\n"
+        f"  1. 4H level swiped\n"
+        f"  2. 5M structure shift occurs\n"
+        f"  3. RSI crosses 50 midline\n\n"
+        f"Send /signal for an on-demand check, or /stop to turn off alerts.",
+        parse_mode=ParseMode.MARKDOWN
     )
-
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -90,83 +95,87 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(state)
     await update.message.reply_text("Automatic alerts turned off. Send /start to re-enable.")
 
-
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Analyzing XAUUSD 15M...")
-    try:
-        result = analyze()
-    except Exception as e:
-        logger.exception("Analysis failed")
-        await update.message.reply_text(f"Error fetching/analyzing data: {e}")
-        return
-
-    if result["direction"] == "NEUTRAL":
-        msg = (
-            f"📊 *XAUUSD 15M — NO CLEAR SIGNAL*\n\n"
-            f"Price: {result['price']:.2f}\n"
-            f"Indicators are mixed — sit out this one.\n\n"
-            f"_Reasoning:_\n" + "\n".join(f"• {r}" for r in result["reasons"])
+    await update.message.reply_text("Analyzing all pairs...")
+    
+    results = []
+    for symbol in PAIRS.keys():
+        try:
+            result = analyze_pair(symbol)
+            if result["direction"] != "NEUTRAL":
+                results.append((symbol, result))
+        except Exception as e:
+            logger.error(f"Analysis failed for {symbol}: {e}")
+    
+    if not results:
+        await update.message.reply_text(
+            "📊 *No Signals Detected*\n\n"
+            "All pairs are currently neutral. Waiting for conditions to align.",
+            parse_mode=ParseMode.MARKDOWN
         )
-    else:
-        msg = format_signal_message(result)
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
+        return
+    
+    for symbol, result in results:
+        msg = format_signal_message(symbol, result)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def check_for_new_signal(context: ContextTypes.DEFAULT_TYPE):
-    """Runs on a schedule. Pushes a message only when direction CHANGES
-    to BUY or SELL (i.e. a fresh signal), not on every check."""
+    """Runs on schedule. Pushes message when a new signal appears."""
     state = load_state()
     if not state["chat_ids"]:
-        return  # nobody subscribed yet
-
-    try:
-        result = analyze()
-    except Exception as e:
-        logger.error(f"Background check failed: {e}")
         return
-
-    direction = result["direction"]
-    last_direction = state.get("last_direction")
-
-    # Only alert on a genuine new actionable signal (not NEUTRAL,
-    # and not the same direction repeated from last check)
-    if direction in ("BUY", "SELL") and direction != last_direction:
-        msg = format_signal_message(result)
-        for chat_id in state["chat_ids"]:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.error(f"Failed to send to {chat_id}: {e}")
-
-    state["last_direction"] = direction
-    save_state(state)
-
+    
+    # Initialize alerts_sent if not exists
+    if "alerts_sent" not in state:
+        state["alerts_sent"] = {}
+    
+    for symbol in PAIRS.keys():
+        try:
+            result = analyze_pair(symbol)
+            direction = result["direction"]
+            
+            if direction in ("BUY", "SELL"):
+                # Check if alert already sent for this signal
+                alert_key = f"{symbol}_{result['signal_id']}"
+                if alert_key not in state["alerts_sent"]:
+                    msg = format_signal_message(symbol, result)
+                    for chat_id in state["chat_ids"]:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=msg,
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                            logger.info(f"Alert sent: {symbol} - {direction}")
+                        except Exception as e:
+                            logger.error(f"Failed to send to {chat_id}: {e}")
+                    
+                    # Mark alert as sent
+                    state["alerts_sent"][alert_key] = True
+                    save_state(state)
+                    
+        except Exception as e:
+            logger.error(f"Background check failed for {symbol}: {e}")
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable not set")
-
-    # Start the tiny web server in the background so Render's free
-    # Web Service tier accepts this deployment and keeps it pingable.
+    
+    # Start web server
     threading.Thread(target=run_web_server, daemon=True).start()
-
+    
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("signal", signal))
-
+    
     # Schedule background checks
     app.job_queue.run_repeating(
         check_for_new_signal, interval=CHECK_INTERVAL_SECONDS, first=10
     )
-
-    logger.info("Bot starting with background watcher...")
+    
+    logger.info("London Session Bot starting...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
-        
