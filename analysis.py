@@ -1,36 +1,52 @@
 """
-Gold (XAUUSD) Smart Money Concepts analysis — multi-timeframe.
+London Session Strategy - Multi-pair analysis
 
-Logic:
-  4H  -> macro trend bias (EMA structure + higher high/higher low pattern)
-  1H  -> confirms bias is intact, identifies the active supply/demand zone
-  15M -> waits for price to actually tap that zone and react, confirms
-         with RSI/MACD before firing a signal
+Strategy Rules:
+1. 4H candle high/low must be swiped (touched)
+2. 5M structure shift (break of swing high/low)
+3. RSI crosses 50 midline
 
-A signal only fires when ALL THREE align. This is intentionally strict —
-fewer signals, but each one means 4H trend + 1H structure + 15M reaction
-all agree, matching real SMC confluence trading instead of a simple
-indicator vote.
+Pairs: EURUSD, GBPUSD, US500, US30, NAS100
 """
 import requests
 import pandas as pd
 import numpy as np
 import os
+from datetime import datetime, time
+import pytz
 
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
-SYMBOL = "XAU/USD"
-RR_RATIO = 2  # 1:2 risk-reward
 
-ZONE_LOOKBACK = 30        # candles to scan for swing-based zones
-ZONE_TOUCH_BUFFER = 0.0015  # 0.15% price buffer to count as "tapping" a zone
+# Pairs to monitor
+PAIRS = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "US500": "SPX",      # S&P 500
+    "US30": "DJI",       # Dow Jones
+    "NAS100": "NDX"      # Nasdaq
+}
+
+# Session times (GMT)
+LONDON_START = time(7, 0)
+LONDON_END = time(15, 0)
+LEVEL_START = time(13, 0)
+LEVEL_END = time(14, 0)
+
+# RSI period
+RSI_PERIOD = 14
+
+# Track 4H levels per pair (reset daily)
+_levels_cache = {}
+_levels_date = None
 
 
 # ---------- Data ----------
 
-def fetch_candles(interval, outputsize=150):
+def fetch_candles(symbol, interval, outputsize=150):
+    """Fetch candle data from TwelveData"""
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
@@ -38,10 +54,10 @@ def fetch_candles(interval, outputsize=150):
     }
     resp = requests.get(url, params=params, timeout=15)
     data = resp.json()
-
+    
     if "values" not in data:
         raise ValueError(f"TwelveData error ({interval}): {data.get('message', data)}")
-
+    
     df = pd.DataFrame(data["values"])
     df = df.rename(columns={"datetime": "time"})
     for col in ["open", "high", "low", "close"]:
@@ -53,11 +69,8 @@ def fetch_candles(interval, outputsize=150):
 
 # ---------- Indicators ----------
 
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def rsi(series, period=14):
+def rsi(series, period=RSI_PERIOD):
+    """Calculate RSI"""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -67,15 +80,8 @@ def rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
-    return macd_line - signal_line  # histogram
-
-
 def atr(df, period=14):
+    """Average True Range"""
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -86,169 +92,180 @@ def atr(df, period=14):
     return tr.rolling(period).mean()
 
 
-# ---------- Structure / bias ----------
+# ---------- Strategy Functions ----------
 
-def find_swings(df, window=3):
-    """Mark swing highs/lows using a simple fractal: a candle whose high/low
-    is the most extreme within `window` candles on each side."""
-    highs, lows = df["high"], df["low"]
-    swing_high = pd.Series(False, index=df.index)
-    swing_low = pd.Series(False, index=df.index)
-    for i in range(window, len(df) - window):
-        if highs[i] == highs[i - window:i + window + 1].max():
-            swing_high[i] = True
-        if lows[i] == lows[i - window:i + window + 1].min():
-            swing_low[i] = True
-    return swing_high, swing_low
+def get_4h_levels(symbol):
+    """Get 4H candle high and low for a symbol"""
+    try:
+        df = fetch_candles(symbol, "4h", 1)
+        if df.empty:
+            return None, None
+        return df["high"].iloc[-1], df["low"].iloc[-1]
+    except Exception as e:
+        print(f"Error getting 4H levels for {symbol}: {e}")
+        return None, None
 
 
-def determine_bias(df):
-    """Determine trend bias from EMA stack + swing structure
-    (higher highs/higher lows = bullish, lower highs/lower lows = bearish)."""
-    df = df.copy()
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    swing_high, swing_low = find_swings(df, window=3)
-
-    recent_highs = df.loc[swing_high, "high"].tail(2).tolist()
-    recent_lows = df.loc[swing_low, "low"].tail(2).tolist()
-
-    structure = "unclear"
-    if len(recent_highs) == 2 and len(recent_lows) == 2:
-        if recent_highs[-1] > recent_highs[-2] and recent_lows[-1] > recent_lows[-2]:
-            structure = "bullish"
-        elif recent_highs[-1] < recent_highs[-2] and recent_lows[-1] < recent_lows[-2]:
-            structure = "bearish"
-
-    last = df.iloc[-1]
-    ema_trend = "bullish" if last["ema20"] > last["ema50"] else "bearish"
-
-    if structure == ema_trend:
-        bias = structure
-    elif structure == "unclear":
-        bias = ema_trend
-    else:
-        bias = "mixed"  # EMA and structure disagree -> no clean bias
-
-    return bias, df
+def is_london_session():
+    """Check if currently in London trading session"""
+    now = datetime.now(pytz.timezone('GMT')).time()
+    return LONDON_START <= now <= LONDON_END
 
 
-# ---------- Supply / demand zones ----------
-
-def find_zones(df, window=3):
-    """Identify the most recent unmitigated demand zone (last bullish swing
-    low with a strong move away) and supply zone (last bearish swing high
-    with a strong move away)."""
-    swing_high, swing_low = find_swings(df, window=window)
-
-    demand_zone = None
-    for i in df.index[swing_low][::-1]:
-        if i + 1 < len(df) and df["close"][i + 1] > df["high"][i]:
-            demand_zone = (df["low"][i], df["high"][i])
-            break
-
-    supply_zone = None
-    for i in df.index[swing_high][::-1]:
-        if i + 1 < len(df) and df["close"][i + 1] < df["low"][i]:
-            supply_zone = (df["low"][i], df["high"][i])
-            break
-
-    return demand_zone, supply_zone
+def is_level_formation_time():
+    """Check if it's 1-2pm GMT for 4H level formation"""
+    now = datetime.now(pytz.timezone('GMT')).time()
+    return LEVEL_START <= now <= LEVEL_END
 
 
-def price_in_zone(price, zone, buffer_pct=ZONE_TOUCH_BUFFER):
-    if zone is None:
-        return False
-    low, high = zone
-    buffer = price * buffer_pct
-    return (low - buffer) <= price <= (high + buffer)
+def detect_structure_shift(df):
+    """Detect 5M structure shift (break of swing high/low)"""
+    if len(df) < 20:
+        return None
+    
+    # Recent swing high and low (last 10 candles)
+    recent_high = df["high"].iloc[-10:].max()
+    recent_low = df["low"].iloc[-10:].min()
+    
+    current_close = df["close"].iloc[-1]
+    previous_close = df["close"].iloc[-2]
+    
+    # Break above swing high = BUY signal
+    if current_close > recent_high and previous_close <= recent_high:
+        return "BUY"
+    # Break below swing low = SELL signal
+    elif current_close < recent_low and previous_close >= recent_low:
+        return "SELL"
+    
+    return None
 
 
-# ---------- Main analysis ----------
+def check_level_swiped(price, level_high, level_low, tolerance=0.001):
+    """Check if price has swiped 4H high or low"""
+    if price >= level_high * (1 - tolerance):
+        return "HIGH_SWIPED"
+    elif price <= level_low * (1 + tolerance):
+        return "LOW_SWIPED"
+    return None
 
-def analyze():
-    df_4h = fetch_candles("4h", 100)
-    df_1h = fetch_candles("1h", 150)
-    df_15m = fetch_candles("15min", 150)
 
-    bias_4h, _ = determine_bias(df_4h)
-    bias_1h, df_1h = determine_bias(df_1h)
-
-    demand_zone, supply_zone = find_zones(df_1h)
-
-    df_15m = df_15m.copy()
-    df_15m["rsi"] = rsi(df_15m["close"], 14)
-    df_15m["macd_hist"] = macd(df_15m["close"])
-    df_15m["atr"] = atr(df_15m, 14)
-
-    last = df_15m.iloc[-1]
+def analyze_pair(display_name):
+    """
+    Analyze a single pair for London session strategy signals
+    
+    Returns:
+        dict: {
+            "direction": "BUY" | "SELL" | "NEUTRAL",
+            "price": float,
+            "level_high": float,
+            "level_low": float,
+            "signal_id": str,
+            "reasons": list
+        }
+    """
+    symbol = PAIRS[display_name]
+    reasons = []
+    
+    # 1. Get 4H levels (only valid during/after 1-2pm GMT)
+    global _levels_cache, _levels_date
+    current_date = datetime.now(pytz.timezone('GMT')).date()
+    
+    # Reset cache at midnight
+    if _levels_date != current_date:
+        _levels_cache = {}
+        _levels_date = current_date
+    
+    if display_name not in _levels_cache:
+        high, low = get_4h_levels(symbol)
+        if high is not None and low is not None:
+            _levels_cache[display_name] = (high, low)
+            reasons.append(f"4H Level set: High={high:.4f}, Low={low:.4f}")
+        else:
+            reasons.append("Failed to get 4H levels")
+            return {"direction": "NEUTRAL", "price": 0, "level_high": 0, "level_low": 0, "signal_id": "", "reasons": reasons}
+    
+    level_high, level_low = _levels_cache[display_name]
+    
+    # 2. Get current price (from 5M data)
+    try:
+        df_5m = fetch_candles(symbol, "5min", 100)
+        if df_5m.empty:
+            reasons.append("Failed to get 5M data")
+            return {"direction": "NEUTRAL", "price": 0, "level_high": level_high, "level_low": level_low, "signal_id": "", "reasons": reasons}
+    except Exception as e:
+        reasons.append(f"Error fetching 5M data: {e}")
+        return {"direction": "NEUTRAL", "price": 0, "level_high": level_high, "level_low": level_low, "signal_id": "", "reasons": reasons}
+    
+    last = df_5m.iloc[-1]
     price = last["close"]
-
-    reasons = [
-        f"4H bias: {bias_4h}",
-        f"1H bias: {bias_1h}",
-    ]
-
-    direction = "NEUTRAL"
-
-    # Require 4H and 1H to agree before considering any trade
-    htf_bias = None
-    if bias_4h == bias_1h and bias_4h in ("bullish", "bearish"):
-        htf_bias = bias_4h
-        reasons.append("4H and 1H bias aligned")
+    
+    # 3. Check if 4H level was swiped
+    swipe_status = check_level_swiped(price, level_high, level_low)
+    if swipe_status is None:
+        reasons.append(f"Price ({price:.4f}) has not swiped 4H levels yet")
+        return {"direction": "NEUTRAL", "price": price, "level_high": level_high, "level_low": level_low, "signal_id": "", "reasons": reasons}
+    
+    reasons.append(f"✓ 4H level swiped: {swipe_status}")
+    
+    # 4. Check structure shift
+    structure_signal = detect_structure_shift(df_5m)
+    if structure_signal is None:
+        reasons.append("No 5M structure shift detected")
+        return {"direction": "NEUTRAL", "price": price, "level_high": level_high, "level_low": level_low, "signal_id": "", "reasons": reasons}
+    
+    reasons.append(f"✓ 5M structure shift: {structure_signal}")
+    
+    # 5. Check RSI 50 cross
+    df_5m["rsi"] = rsi(df_5m["close"], RSI_PERIOD)
+    current_rsi = df_5m["rsi"].iloc[-1]
+    previous_rsi = df_5m["rsi"].iloc[-2]
+    
+    rsi_signal = None
+    if current_rsi > 50 and previous_rsi <= 50:
+        rsi_signal = "BUY"
+        reasons.append(f"✓ RSI crossed above 50 ({current_rsi:.1f})")
+    elif current_rsi < 50 and previous_rsi >= 50:
+        rsi_signal = "SELL"
+        reasons.append(f"✓ RSI crossed below 50 ({current_rsi:.1f})")
     else:
-        reasons.append("4H/1H bias not aligned — no trade")
-
-    if htf_bias == "bullish":
-        reasons.append(
-            f"Demand zone: {demand_zone[0]:.2f}-{demand_zone[1]:.2f}" if demand_zone
-            else "No clear demand zone found"
-        )
-        if price_in_zone(price, demand_zone):
-            reasons.append(f"Price ({price:.2f}) is reacting at demand zone")
-            if last["rsi"] < 50 and last["macd_hist"] > df_15m["macd_hist"].iloc[-2]:
-                reasons.append(f"RSI {last['rsi']:.1f} recovering, MACD histogram rising")
-                direction = "BUY"
-            else:
-                reasons.append("Waiting — 15M momentum not confirming yet")
-        else:
-            reasons.append("Price has not reached the demand zone yet")
-
-    elif htf_bias == "bearish":
-        reasons.append(
-            f"Supply zone: {supply_zone[0]:.2f}-{supply_zone[1]:.2f}" if supply_zone
-            else "No clear supply zone found"
-        )
-        if price_in_zone(price, supply_zone):
-            reasons.append(f"Price ({price:.2f}) is reacting at supply zone")
-            if last["rsi"] > 50 and last["macd_hist"] < df_15m["macd_hist"].iloc[-2]:
-                reasons.append(f"RSI {last['rsi']:.1f} fading, MACD histogram falling")
-                direction = "SELL"
-            else:
-                reasons.append("Waiting — 15M momentum not confirming yet")
-        else:
-            reasons.append("Price has not reached the supply zone yet")
-
-    atr_val = last["atr"]
-    sl_distance = atr_val * 1.0
-    tp_distance = sl_distance * RR_RATIO
-
-    if direction == "BUY":
-        sl = price - sl_distance
-        tp = price + tp_distance
-    elif direction == "SELL":
-        sl = price + sl_distance
-        tp = price - tp_distance
+        reasons.append(f"RSI at {current_rsi:.1f} - no 50 cross")
+        return {"direction": "NEUTRAL", "price": price, "level_high": level_high, "level_low": level_low, "signal_id": "", "reasons": reasons}
+    
+    # 6. Confirm all conditions align
+    direction = None
+    if structure_signal == "BUY" and rsi_signal == "BUY" and swipe_status == "HIGH_SWIPED":
+        direction = "BUY"
+    elif structure_signal == "SELL" and rsi_signal == "SELL" and swipe_status == "LOW_SWIPED":
+        direction = "SELL"
     else:
-        sl = tp = None
-
+        reasons.append("Conditions don't align (structure, RSI, swipe mismatch)")
+        return {"direction": "NEUTRAL", "price": price, "level_high": level_high, "level_low": level_low, "signal_id": "", "reasons": reasons}
+    
+    # 7. Generate signal ID for deduplication
+    signal_id = f"{display_name}_{direction}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    
+    reasons.append(f"✅ ALL CONDITIONS MET! {direction} signal confirmed")
+    
     return {
         "direction": direction,
         "price": price,
-        "sl": sl,
-        "tp": tp,
-        "atr": atr_val,
+        "level_high": level_high,
+        "level_low": level_low,
+        "signal_id": signal_id,
         "reasons": reasons,
-        "time": last["time"],
+        "time": last["time"]
     }
+
+
+# ---------- Original analyze() for backward compatibility ----------
+
+def analyze():
+    """
+    Legacy function - returns XAUUSD analysis
+    Kept for compatibility with existing /signal command
+    """
+    # Check if XAUUSD is in our pairs
+    if "XAUUSD" not in PAIRS:
+        PAIRS["XAUUSD"] = "XAU/USD"
     
+    return analyze_pair("XAUUSD")
