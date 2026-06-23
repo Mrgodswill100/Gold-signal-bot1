@@ -1,16 +1,17 @@
 import logging
 import asyncio
+import requests
 from datetime import datetime, time
 import pytz
 import pandas as pd
 import numpy as np
+import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import twelvedata as td
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TWELVEDATA_KEY  = "YOUR_TWELVEDATA_API_KEY"
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TWELVEDATA_KEY  = os.environ.get("TWELVEDATA_API_KEY", "YOUR_TWELVEDATA_API_KEY")
 
 SYMBOLS = ["EUR/USD", "GBP/USD", "US500", "US30", "NAS100"]
 
@@ -42,18 +43,29 @@ monitoring_active: bool = False
 # ─── TWELVEDATA HELPERS ───────────────────────────────────────────────────────
 
 def fetch_candles(symbol: str, interval: str, count: int = 100) -> pd.DataFrame | None:
-    """Fetch OHLCV candles from Twelve Data."""
+    """Fetch OHLCV candles from TwelveData REST API."""
     try:
-        ts = td.time_series(
-            symbol=symbol,
-            interval=interval,
-            outputsize=count,
-            apikey=TWELVEDATA_KEY,
-            timezone="UTC"
-        )
-        df = ts.as_pandas()
-        df.index = pd.to_datetime(df.index, utc=True)
-        df = df.sort_index()
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol":     symbol,
+            "interval":   interval,
+            "outputsize": count,
+            "apikey":     TWELVEDATA_KEY,
+            "order":      "ASC",
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+
+        if "values" not in data:
+            logger.error(f"TwelveData error [{symbol}]: {data.get('message', data)}")
+            return None
+
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={"datetime": "time"})
+        for col in ["open", "high", "low", "close"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df = df.sort_values("time").reset_index(drop=True)
         return df
     except Exception as e:
         logger.error(f"fetch_candles error [{symbol}]: {e}")
